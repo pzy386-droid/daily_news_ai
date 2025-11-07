@@ -1,0 +1,239 @@
+# 导入所有依赖库
+from pydantic import BaseModel
+from typing import Optional
+import logging
+import os
+import requests
+from bs4 import BeautifulSoup
+from gtts import gTTS
+from moviepy.editor import AudioFileClip, ImageClip
+from langchain.chat_models import ChatDeepSeek
+from langchain.schema import HumanMessage
+from langgraph.graph import StateGraph, END
+
+# -------------------------- 1. 全局配置 --------------------------
+# DeepSeek大模型配置（替换为你的API密钥）
+DEEPSEEK_API_KEY = "sk-fcf857583a554b7885233424fe43d70a"
+LLM_MODEL = "deepseek-chat"
+
+# 文件路径配置
+OUTPUT_DIR = "output"  # 生成文件存储目录
+LOG_DIR = "logs"       # 日志存储目录
+BACKGROUND_IMAGE = "background.jpg"  # 视频背景图片（需放在项目根目录）
+
+# 创建必要目录（不存在则自动生成）
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# 日志配置（记录流程状态，便于调试）
+logging.basicConfig(
+    filename=os.path.join(LOG_DIR, "workflow.log"),
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# -------------------------- 2. 工作流状态模型 --------------------------
+class WorkflowState(BaseModel):
+    """统一管理各节点输入/输出数据，实现模块间数据流转"""
+    # 爬虫节点相关
+    raw_text: Optional[str] = None  # 爬取的原始文本
+    crawl_success: bool = False     # 爬取状态（成功/失败）
+    
+    # 摘要生成节点相关
+    summary_text: Optional[str] = None  # 生成的核心摘要
+    summary_success: bool = False       # 摘要状态
+    
+    # TTS节点相关
+    audio_path: Optional[str] = None  # 音频文件路径
+    tts_success: bool = False         # TTS状态
+    
+    # 视频合成节点相关
+    video_path: Optional[str] = None  # 最终视频路径
+    video_success: bool = False       # 视频合成状态
+    
+    # 全局错误信息
+    error_msg: Optional[str] = None  # 存储流程中的错误详情
+
+# -------------------------- 3. 核心节点逻辑 --------------------------
+def crawl_node(state: WorkflowState) -> WorkflowState:
+    """爬虫节点：从目标URL提取纯文本，过滤HTML标签"""
+    logging.info("启动爬虫节点")
+    target_url = "https://example.com"  # 可替换为实际目标URL
+    
+    try:
+        # 发送HTTP请求（超时10秒）
+        response = requests.get(target_url, timeout=10)
+        response.raise_for_status()  # 抛出HTTP错误（如404、500）
+        
+        # 解析HTML并提取文本
+        soup = BeautifulSoup(response.text, "html.parser")
+        raw_text = soup.get_text().strip()
+        
+        # 过滤无效文本（长度小于50字符视为无效）
+        if len(raw_text) < 50:
+            raise ValueError(f"爬取文本过短（仅{len(raw_text)}字符）")
+        
+        logging.info(f"爬虫节点执行成功，文本长度：{len(raw_text)}字符")
+        return WorkflowState(
+            **state.dict(),
+            raw_text=raw_text,
+            crawl_success=True
+        )
+    except Exception as e:
+        error_detail = f"爬虫节点失败：{str(e)}"
+        logging.error(error_detail)
+        return WorkflowState(**state.dict(), error_msg=error_detail)
+
+def summary_node(state: WorkflowState) -> WorkflowState:
+    """摘要生成节点：调用DeepSeek大模型生成100字内核心摘要"""
+    logging.info("启动摘要生成节点")
+    
+    # 前置校验：爬虫失败则跳过
+    if not state.crawl_success:
+        error_detail = "摘要节点跳过：爬虫未成功执行"
+        logging.warning(error_detail)
+        return WorkflowState(**state.dict(), error_msg=error_detail)
+    
+    try:
+        # 初始化大模型客户端
+        llm = ChatDeepSeek(
+            api_key=DEEPSEEK_API_KEY,
+            model=LLM_MODEL,
+            temperature=0.6  # 控制随机性（0-1，值越小越稳定）
+        )
+        
+        # 构建提示词并调用模型
+        prompt = f"将以下文本总结为100字内核心摘要：\n{state.raw_text}"
+        response = llm([HumanMessage(content=prompt)])
+        summary_text = response.content.strip()
+        
+        logging.info("摘要生成节点执行成功")
+        return WorkflowState(
+            **state.dict(),
+            summary_text=summary_text,
+            summary_success=True
+        )
+    except Exception as e:
+        error_detail = f"摘要节点失败：{str(e)}"
+        logging.error(error_detail)
+        return WorkflowState(**state.dict(), error_msg=error_detail)
+
+def tts_node(state: WorkflowState) -> WorkflowState:
+    """TTS节点：将摘要文本转换为中文音频（MP3格式）"""
+    logging.info("启动TTS节点")
+    
+    # 前置校验：摘要失败则跳过
+    if not state.summary_success:
+        error_detail = "TTS节点跳过：摘要未成功执行"
+        logging.warning(error_detail)
+        return WorkflowState(**state.dict(), error_msg=error_detail)
+    
+    try:
+        # 音频输出路径
+        audio_path = os.path.join(OUTPUT_DIR, "summary_audio.mp3")
+        
+        # 生成中文音频（正常语速）
+        tts = gTTS(text=state.summary_text, lang="zh-CN", slow=False)
+        tts.save(audio_path)
+        
+        logging.info(f"TTS节点执行成功，音频路径：{audio_path}")
+        return WorkflowState(
+            **state.dict(),
+            audio_path=audio_path,
+            tts_success=True
+        )
+    except Exception as e:
+        error_detail = f"TTS节点失败：{str(e)}"
+        logging.error(error_detail)
+        return WorkflowState(**state.dict(), error_msg=error_detail)
+
+def video_synthesis_node(state: WorkflowState) -> WorkflowState:
+    """视频合成节点：结合音频与背景图片生成MP4视频"""
+    logging.info("启动视频合成节点")
+    
+    # 前置校验：TTS失败则跳过
+    if not state.tts_success:
+        error_detail = "视频节点跳过：TTS未成功执行"
+        logging.warning(error_detail)
+        return WorkflowState(**state.dict(), error_msg=error_detail)
+    
+    try:
+        # 校验背景图片是否存在
+        if not os.path.exists(BACKGROUND_IMAGE):
+            raise FileNotFoundError(f"背景图片不存在：{BACKGROUND_IMAGE}（需放在项目根目录）")
+        
+        # 视频输出路径
+        video_path = os.path.join(OUTPUT_DIR, "final_video.mp4")
+        
+        # 加载音频和图片
+        audio_clip = AudioFileClip(state.audio_path)
+        image_clip = ImageClip(BACKGROUND_IMAGE)
+        
+        # 同步视频时长与音频一致（24fps帧率）
+        image_clip = image_clip.set_duration(audio_clip.duration).set_fps(24)
+        video_clip = image_clip.set_audio(audio_clip)
+        
+        # 导出视频（MP4标准编码，兼容性好）
+        video_clip.write_videofile(video_path, codec="libx264", audio_codec="aac")
+        
+        # 释放资源
+        audio_clip.close()
+        image_clip.close()
+        video_clip.close()
+        
+        logging.info(f"视频合成节点执行成功，视频路径：{video_path}")
+        return WorkflowState(
+            **state.dict(),
+            video_path=video_path,
+            video_success=True
+        )
+    except Exception as e:
+        error_detail = f"视频节点失败：{str(e)}"
+        logging.error(error_detail)
+        return WorkflowState(**state.dict(), error_msg=error_detail)
+
+# -------------------------- 4. 工作流搭建与执行 --------------------------
+def build_and_run_workflow():
+    """构建LangGraph工作流并启动执行"""
+    # 1. 初始化工作流（绑定状态模型）
+    workflow = StateGraph(WorkflowState)
+    
+    # 2. 添加节点
+    workflow.add_node("crawl", crawl_node)               # 爬虫节点
+    workflow.add_node("summary", summary_node)           # 摘要节点
+    workflow.add_node("tts", tts_node)                   # TTS节点
+    workflow.add_node("video_synthesis", video_synthesis_node)  # 视频合成节点
+    
+    # 3. 定义执行顺序：爬虫→摘要→TTS→视频合成→结束
+    workflow.set_entry_point("crawl")
+    workflow.add_edge("crawl", "summary")
+    workflow.add_edge("summary", "tts")
+    workflow.add_edge("tts", "video_synthesis")
+    workflow.add_edge("video_synthesis", END)
+    
+    # 4. 编译工作流
+    app = workflow.compile()
+    
+    # 5. 启动工作流（初始状态为空，所有字段默认值）
+    initial_state = WorkflowState()
+    result = app.invoke(initial_state)
+    
+    # 6. 输出执行结果
+    print("=" * 60)
+    print("LangGraph自动化工作流执行完成")
+    print("=" * 60)
+    print(f"爬虫节点：{'✅ 成功' if result.crawl_success else '❌ 失败'}")
+    print(f"摘要节点：{'✅ 成功' if result.summary_success else '❌ 失败'}")
+    print(f"TTS节点：{'✅ 成功' if result.tts_success else '❌ 失败'}")
+    print(f"视频合成节点：{'✅ 成功' if result.video_success else '❌ 失败'}")
+    if result.audio_path:
+        print(f"\n📌 音频文件路径：{result.audio_path}")
+    if result.video_path:
+        print(f"📌 视频文件路径：{result.video_path}")
+    if result.error_msg:
+        print(f"\n❌ 错误详情：{result.error_msg}")
+    print("=" * 60)
+
+# -------------------------- 执行入口 --------------------------
+if __name__ == "__main__":
+    build_and_run_workflow()
