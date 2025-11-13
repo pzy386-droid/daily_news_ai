@@ -1,0 +1,335 @@
+from pydantic import BaseModel
+from typing import Optional, Literal
+import logging
+import os
+import requests
+from bs4 import BeautifulSoup
+from gtts import gTTS
+from moviepy.editor import AudioFileClip, ImageClip, ColorClip
+from langchain.chat_models import ChatDeepSeek
+from langchain.schema import HumanMessage
+from langgraph.graph import StateGraph, END
+
+# -------------------------- 1. 全局配置 --------------------------
+# 新增：工作流模式（真实/模拟）
+WORKFLOW_MODE: Literal["real", "mock"] = "mock"  # 默认使用模拟模式
+
+# DeepSeek大模型配置
+DEEPSEEK_API_KEY = "sk-fcf857583a554b7885233424fe43d70a"
+LLM_MODEL = "deepseek-chat"
+
+# 文件路径配置
+OUTPUT_DIR = "output"
+LOG_DIR = "logs"
+BACKGROUND_IMAGE = "background.jpg"
+
+# 创建必要目录
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# 日志配置
+logging.basicConfig(
+    filename=os.path.join(LOG_DIR, "workflow.log"),
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# -------------------------- 2. 工作流状态模型 --------------------------
+class WorkflowState(BaseModel):
+    """统一管理各节点输入/输出数据"""
+    # 爬虫节点相关
+    raw_text: Optional[str] = None
+    crawl_success: bool = False
+    
+    # 摘要生成节点相关
+    summary_text: Optional[str] = None
+    summary_success: bool = False
+    
+    # TTS节点相关
+    audio_path: Optional[str] = None
+    tts_success: bool = False
+    
+    # 视频合成节点相关
+    video_path: Optional[str] = None
+    video_success: bool = False
+    
+    # 全局信息
+    error_msg: Optional[str] = None
+    mode: str = WORKFLOW_MODE  # 记录当前运行模式
+
+# -------------------------- 3. 模拟节点（Mock Nodes） --------------------------
+def mock_crawl_node(state: WorkflowState) -> WorkflowState:
+    """模拟爬虫节点：返回预设的测试文本"""
+    logging.info("启动模拟爬虫节点")
+    try:
+        # 模拟爬取的内容（包含足够长度的文本）
+        mock_text = """这是一段模拟爬取的文本内容。人工智能（AI）是研究、开发用于模拟、延伸和扩展人的智能的理论、方法、技术及应用系统的一门新的技术科学。
+        人工智能的研究领域包括机器人、语言识别、图像识别、自然语言处理和专家系统等。随着技术的发展，AI在医疗、金融、教育等多个领域都有广泛应用。"""
+        
+        logging.info("模拟爬虫节点执行成功")
+        return WorkflowState(
+            **state.dict(),
+            raw_text=mock_text,
+            crawl_success=True
+        )
+    except Exception as e:
+        error_detail = f"模拟爬虫节点失败：{str(e)}"
+        logging.error(error_detail)
+        return WorkflowState(** state.dict(), error_msg=error_detail)
+
+def mock_summary_node(state: WorkflowState) -> WorkflowState:
+    """模拟摘要节点：返回预设的摘要结果"""
+    logging.info("启动模拟摘要节点")
+    if not state.crawl_success:
+        error_detail = "模拟摘要节点跳过：爬虫未成功执行"
+        logging.warning(error_detail)
+        return WorkflowState(**state.dict(), error_msg=error_detail)
+    
+    try:
+        # 模拟摘要结果
+        mock_summary = "人工智能是一门研究模拟人类智能的技术科学，涵盖机器人、语言识别等多个领域，目前已在医疗、金融等行业广泛应用。"
+        
+        logging.info("模拟摘要节点执行成功")
+        return WorkflowState(
+            **state.dict(),
+            summary_text=mock_summary,
+            summary_success=True
+        )
+    except Exception as e:
+        error_detail = f"模拟摘要节点失败：{str(e)}"
+        logging.error(error_detail)
+        return WorkflowState(** state.dict(), error_msg=error_detail)
+
+def mock_tts_node(state: WorkflowState) -> WorkflowState:
+    """模拟TTS节点：生成包含固定内容的音频文件"""
+    logging.info("启动模拟TTS节点")
+    if not state.summary_success:
+        error_detail = "模拟TTS节点跳过：摘要未成功执行"
+        logging.warning(error_detail)
+        return WorkflowState(**state.dict(), error_msg=error_detail)
+    
+    try:
+        # 生成模拟音频（使用摘要文本但标记为模拟）
+        audio_path = os.path.join(OUTPUT_DIR, "mock_summary_audio.mp3")
+        tts = gTTS(text=f"这是模拟生成的音频。{state.summary_text}", lang="zh-CN", slow=False)
+        tts.save(audio_path)
+        
+        logging.info(f"模拟TTS节点执行成功，音频路径：{audio_path}")
+        return WorkflowState(
+            **state.dict(),
+            audio_path=audio_path,
+            tts_success=True
+        )
+    except Exception as e:
+        error_detail = f"模拟TTS节点失败：{str(e)}"
+        logging.error(error_detail)
+        return WorkflowState(** state.dict(), error_msg=error_detail)
+
+def mock_video_synthesis_node(state: WorkflowState) -> WorkflowState:
+    """模拟视频合成节点：使用纯色背景代替真实图片"""
+    logging.info("启动模拟视频合成节点")
+    if not state.tts_success:
+        error_detail = "模拟视频节点跳过：TTS未成功执行"
+        logging.warning(error_detail)
+        return WorkflowState(**state.dict(), error_msg=error_detail)
+    
+    try:
+        # 视频输出路径
+        video_path = os.path.join(OUTPUT_DIR, "mock_final_video.mp4")
+        
+        # 使用纯色背景（避免依赖真实图片）
+        audio_clip = AudioFileClip(state.audio_path)
+        # 创建1280x720的蓝色背景
+        image_clip = ColorClip(size=(1280, 720), color=(0, 0, 255))  # RGB蓝色
+        
+        # 同步时长
+        image_clip = image_clip.set_duration(audio_clip.duration).set_fps(24)
+        video_clip = image_clip.set_audio(audio_clip)
+        
+        # 导出视频
+        video_clip.write_videofile(video_path, codec="libx264", audio_codec="aac")
+        
+        # 释放资源
+        audio_clip.close()
+        image_clip.close()
+        video_clip.close()
+        
+        logging.info(f"模拟视频合成节点执行成功，视频路径：{video_path}")
+        return WorkflowState(
+            **state.dict(),
+            video_path=video_path,
+            video_success=True
+        )
+    except Exception as e:
+        error_detail = f"模拟视频节点失败：{str(e)}"
+        logging.error(error_detail)
+        return WorkflowState(** state.dict(), error_msg=error_detail)
+
+# -------------------------- 4. 真实节点（Real Nodes） --------------------------
+def crawl_node(state: WorkflowState) -> WorkflowState:
+    """真实爬虫节点：从目标URL提取文本"""
+    logging.info("启动真实爬虫节点")
+    target_url = "https://example.com"  # 可替换为实际URL
+    
+    try:
+        response = requests.get(target_url, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, "html.parser")
+        raw_text = soup.get_text().strip()
+        
+        if len(raw_text) < 50:
+            raise ValueError(f"爬取文本过短（仅{len(raw_text)}字符）")
+        
+        logging.info(f"真实爬虫节点执行成功，文本长度：{len(raw_text)}字符")
+        return WorkflowState(
+            **state.dict(),
+            raw_text=raw_text,
+            crawl_success=True
+        )
+    except Exception as e:
+        error_detail = f"真实爬虫节点失败：{str(e)}"
+        logging.error(error_detail)
+        return WorkflowState(** state.dict(), error_msg=error_detail)
+
+def summary_node(state: WorkflowState) -> WorkflowState:
+    """真实摘要节点：调用DeepSeek生成摘要"""
+    logging.info("启动真实摘要节点")
+    if not state.crawl_success:
+        error_detail = "真实摘要节点跳过：爬虫未成功执行"
+        logging.warning(error_detail)
+        return WorkflowState(**state.dict(), error_msg=error_detail)
+    
+    try:
+        llm = ChatDeepSeek(
+            api_key=DEEPSEEK_API_KEY,
+            model=LLM_MODEL,
+            temperature=0.6
+        )
+        
+        prompt = f"将以下文本总结为100字内核心摘要：\n{state.raw_text}"
+        response = llm([HumanMessage(content=prompt)])
+        summary_text = response.content.strip()
+        
+        logging.info("真实摘要节点执行成功")
+        return WorkflowState(
+            **state.dict(),
+            summary_text=summary_text,
+            summary_success=True
+        )
+    except Exception as e:
+        error_detail = f"真实摘要节点失败：{str(e)}"
+        logging.error(error_detail)
+        return WorkflowState(** state.dict(), error_msg=error_detail)
+
+def tts_node(state: WorkflowState) -> WorkflowState:
+    """真实TTS节点：将摘要转为音频"""
+    logging.info("启动真实TTS节点")
+    if not state.summary_success:
+        error_detail = "真实TTS节点跳过：摘要未成功执行"
+        logging.warning(error_detail)
+        return WorkflowState(**state.dict(), error_msg=error_detail)
+    
+    try:
+        audio_path = os.path.join(OUTPUT_DIR, "summary_audio.mp3")
+        tts = gTTS(text=state.summary_text, lang="zh-CN", slow=False)
+        tts.save(audio_path)
+        
+        logging.info(f"真实TTS节点执行成功，音频路径：{audio_path}")
+        return WorkflowState(
+            **state.dict(),
+            audio_path=audio_path,
+            tts_success=True
+        )
+    except Exception as e:
+        error_detail = f"真实TTS节点失败：{str(e)}"
+        logging.error(error_detail)
+        return WorkflowState(** state.dict(), error_msg=error_detail)
+
+def video_synthesis_node(state: WorkflowState) -> WorkflowState:
+    """真实视频合成节点：使用指定背景图片"""
+    logging.info("启动真实视频合成节点")
+    if not state.tts_success:
+        error_detail = "真实视频节点跳过：TTS未成功执行"
+        logging.warning(error_detail)
+        return WorkflowState(**state.dict(), error_msg=error_detail)
+    
+    try:
+        if not os.path.exists(BACKGROUND_IMAGE):
+            raise FileNotFoundError(f"背景图片不存在：{BACKGROUND_IMAGE}")
+        
+        video_path = os.path.join(OUTPUT_DIR, "final_video.mp4")
+        
+        audio_clip = AudioFileClip(state.audio_path)
+        image_clip = ImageClip(BACKGROUND_IMAGE)
+        
+        image_clip = image_clip.set_duration(audio_clip.duration).set_fps(24)
+        video_clip = image_clip.set_audio(audio_clip)
+        
+        video_clip.write_videofile(video_path, codec="libx264", audio_codec="aac")
+        
+        audio_clip.close()
+        image_clip.close()
+        video_clip.close()
+        
+        logging.info(f"真实视频合成节点执行成功，视频路径：{video_path}")
+        return WorkflowState(
+            **state.dict(),
+            video_path=video_path,
+            video_success=True
+        )
+    except Exception as e:
+        error_detail = f"真实视频节点失败：{str(e)}"
+        logging.error(error_detail)
+        return WorkflowState(** state.dict(), error_msg=error_detail)
+
+# -------------------------- 5. 工作流搭建与执行 --------------------------
+def build_and_run_workflow():
+    """根据模式构建并执行工作流"""
+    workflow = StateGraph(WorkflowState)
+    
+    # 根据运行模式选择节点
+    if WORKFLOW_MODE == "mock":
+        logging.info("使用模拟工作流模式")
+        workflow.add_node("crawl", mock_crawl_node)
+        workflow.add_node("summary", mock_summary_node)
+        workflow.add_node("tts", mock_tts_node)
+        workflow.add_node("video_synthesis", mock_video_synthesis_node)
+    else:
+        logging.info("使用真实工作流模式")
+        workflow.add_node("crawl", crawl_node)
+        workflow.add_node("summary", summary_node)
+        workflow.add_node("tts", tts_node)
+        workflow.add_node("video_synthesis", video_synthesis_node)
+    
+    # 定义执行顺序
+    workflow.set_entry_point("crawl")
+    workflow.add_edge("crawl", "summary")
+    workflow.add_edge("summary", "tts")
+    workflow.add_edge("tts", "video_synthesis")
+    workflow.add_edge("video_synthesis", END)
+    
+    # 编译并执行
+    app = workflow.compile()
+    initial_state = WorkflowState()
+    result = app.invoke(initial_state)
+    
+    # 输出结果
+    print("=" * 60)
+    print(f"LangGraph工作流执行完成（模式：{WORKFLOW_MODE}）")
+    print("=" * 60)
+    print(f"爬虫节点：{'✅ 成功' if result.crawl_success else '❌ 失败'}")
+    print(f"摘要节点：{'✅ 成功' if result.summary_success else '❌ 失败'}")
+    print(f"TTS节点：{'✅ 成功' if result.tts_success else '❌ 失败'}")
+    print(f"视频合成节点：{'✅ 成功' if result.video_success else '❌ 失败'}")
+    if result.audio_path:
+        print(f"\n📌 音频文件路径：{result.audio_path}")
+    if result.video_path:
+        print(f"📌 视频文件路径：{result.video_path}")
+    if result.error_msg:
+        print(f"\n❌ 错误详情：{result.error_msg}")
+    print("=" * 60)
+
+# -------------------------- 执行入口 --------------------------
+if __name__ == "__main__":
+    build_and_run_workflow()
